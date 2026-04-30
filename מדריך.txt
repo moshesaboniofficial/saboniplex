@@ -1,0 +1,6 @@
+git pull מושך לפרוייקט במידה ומתכנת עבד
+
+git status לדעת איזה קבצים עבדתי
+git add . לתת לגיט להשים לב איזה קבצים ערכתי ולעקוב אחריהם
+git commit -m "before i18n completion pass" שומר תגובה 
+git push origin main

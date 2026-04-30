@@ -1,0 +1,4 @@
+# Telegram / TDLib local data
+tdlib.db
+tdlib.db/
+tdlib_files/
