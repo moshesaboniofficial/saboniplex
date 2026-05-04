@@ -13,7 +13,7 @@ from tdlib_saboniplex_maxspeed import (
     pick_movie_root,
     season_folder_name,
     strip_known_ext,
-    tmdb_find_movie,
+    tmdb_find_movie_smart,
     tmdb_find_tv,
     tv_filename,
     windows_safe_filename,
@@ -70,7 +70,7 @@ def simulate(original_name: str, caption_text: str = "", src_path: Optional[str]
             "tmdb": {"used": bool(use_tmdb), "resolved_show": show if use_tmdb else None},
         }
 
-    found = tmdb_find_movie(cleaned_raw or raw_text) if use_tmdb else None
+    found = tmdb_find_movie_smart(raw_text, caption_raw) if use_tmdb else None
     if found:
         en_title = windows_safe_filename(found.get("en_title") or "", 110)
         yy = (found.get("year") or "").strip()

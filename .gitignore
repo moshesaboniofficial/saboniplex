@@ -1,4 +1,16 @@
 # Telegram / TDLib local data
-tdlib.db
-tdlib.db/
+tdlib_db/
 tdlib_files/
+Incoming/
+
+# Local runtime/cache files
+__pycache__/
+*.py[cod]
+classification_decisions.jsonl
+move_actions.jsonl
+classification_overrides.json
+settings.json
+
+# Local secrets/config
+.env
+*.local.json

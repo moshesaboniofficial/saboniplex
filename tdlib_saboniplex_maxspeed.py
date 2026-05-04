@@ -13,10 +13,28 @@ from typing import List
 
 import requests
 import tdjson
+from saboniplex_settings import load_settings
+
+
+def _env_get(name: str, default: str = "") -> str:
+    val = os.environ.get(name)
+    if val is not None:
+        return str(val)
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                val, _ = winreg.QueryValueEx(key, name)
+                return str(val)
+        except Exception:
+            pass
+    return default
+
 
 # ========= CONFIG =========
-API_ID = 38049858
-API_HASH = "f95f3ee0edc76dbf38f4f42045d76bdb"
+API_ID = int(_env_get("SABONIPLEX_API_ID", "0") or "0")
+API_HASH = _env_get("SABONIPLEX_API_HASH", "")
 GROUP_TITLE = "SaboniPlex"
 
 # איפה TDLib ישמור DB וקבצים זמניים (לא ה-Plex)
@@ -32,13 +50,24 @@ MOVIES_DIR = r"F:\Movies"
 KIDS_MOVIES_DIR = r"F:\Kids Movies"
 ISRAELI_MOVIES_DIR = r"F:\Israeli Movies"
 TV_DIR     = r"F:\Series"
+NEEDS_REVIEW_DIR = r"F:\Movies\_Needs Review"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm"}
 
-TMDB_API_KEY = "1eaecec5913d663b4c622c2308eae982"
+TMDB_API_KEY = _env_get("SABONIPLEX_TMDB_API_KEY", "")
 TMDB_TIMEOUT = 12
 _tmdb_session = requests.Session()
 TMDB_CACHE_TTL_SEC = 6 * 60 * 60
 _tmdb_cache: Dict[str, Tuple[float, dict]] = {}
+DECISIONS_LOG_PATH = r"C:\SaboniPlex\classification_decisions.jsonl"
+OVERRIDES_PATH = r"C:\SaboniPlex\classification_overrides.json"
+
+OPENAI_API_KEY = _env_get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = _env_get("SABONIPLEX_AI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+OPENAI_TIMEOUT_SEC = float(_env_get("SABONIPLEX_AI_TIMEOUT_SEC", "8") or "8")
+GROQ_API_KEY = _env_get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = _env_get("SABONIPLEX_GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+GROQ_TIMEOUT_SEC = float(_env_get("SABONIPLEX_GROQ_TIMEOUT_SEC", "8") or "8")
+MOVE_ACTIONS_LOG_PATH = r"C:\SaboniPlex\move_actions.jsonl"
 
 # Local safety overrides: block known-bad TMDB TV mappings by cleaned query.
 # If TMDB consistently resolves a Hebrew show title to the wrong English series,
@@ -84,9 +113,24 @@ def ensure_dirs():
     os.makedirs(KIDS_MOVIES_DIR, exist_ok=True)
     os.makedirs(ISRAELI_MOVIES_DIR, exist_ok=True)
     os.makedirs(TV_DIR, exist_ok=True)
+    os.makedirs(NEEDS_REVIEW_DIR, exist_ok=True)
+    log_parent = os.path.dirname(DECISIONS_LOG_PATH)
+    if log_parent:
+        os.makedirs(log_parent, exist_ok=True)
+    overrides_parent = os.path.dirname(OVERRIDES_PATH)
+    if overrides_parent:
+        os.makedirs(overrides_parent, exist_ok=True)
+    if not os.path.exists(OVERRIDES_PATH):
+        with open(OVERRIDES_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+    move_parent = os.path.dirname(MOVE_ACTIONS_LOG_PATH)
+    if move_parent:
+        os.makedirs(move_parent, exist_ok=True)
 
 
 def set_tdlib_parameters(client_id: int):
+    if not API_ID or not API_HASH:
+        raise RuntimeError("Missing SABONIPLEX_API_ID/SABONIPLEX_API_HASH")
     td_send(client_id, {
         "@type": "setTdlibParameters",
         "database_directory": TDLIB_DB_DIR,
@@ -109,6 +153,24 @@ TV_X_RE   = re.compile(r"\b(?P<s>\d{1,2})\s*x\s*(?P<e>\d{1,3})\b", re.IGNORECASE
 SEP = r"[\s._-]"
 TV_HE_SHORT_RE = re.compile(rf"(?:^|{SEP})ע{SEP}*(?P<s>\d{{1,2}}){SEP}*פ{SEP}*(?P<e>\d{{1,3}})(?:{SEP}|$)")
 TV_HE_LONG_RE  = re.compile(rf"(?:^|{SEP})עונה{SEP}*(?P<s>\d{{1,2}}){SEP}*פרק{SEP}*(?P<e>\d{{1,3}})(?:{SEP}|$)")
+
+
+TITLE_LINE_LABEL_RE = re.compile(r"^\s*(?:name|title|שם)\s*[:\-]\s*(?P<title>.+?)\s*$", re.IGNORECASE)
+YEAR_LINE_LABEL_RE = re.compile(r"^\s*(?:year|שנה)\s*[:\-]\s*(?P<year>19\d{2}|20\d{2})\s*$", re.IGNORECASE)
+NOISE_LINE_RE = re.compile(
+    r"^\s*(?:quality|genre|summary|plot|subtitle|subtitles|audio|source|codec|size|"
+    r"איכות|ז[׳'`\"]?אנר|תקציר|תרגום|כתוביות|דיבוב|מדובב|קודד|הועלה|פורסם)\b",
+    re.IGNORECASE,
+)
+BRACKET_RELEASE_TAG_RE = re.compile(r"\[(?:yts|yify|rarbg|eztv|ettv|psa|amzn|nf|web)[^\]]*\]", re.IGNORECASE)
+TRAILING_RELEASE_TOKEN_RE = re.compile(
+    r"(?:\b(?:web(?:[ ._-]?(?:dl|rip))?|bluray|brrip|bdrip|hdrip|hdr|uhd|"
+    r"x264|x265|h[ .]?264|h[ .]?265|hevc|av1|10bit|repack|proper|remux|"
+    r"aac(?:\s*\d(?:[ ._]\d)?)?|ac3(?:\s*\d(?:[ ._]\d)?)?|eac3(?:\s*\d(?:[ ._]\d)?)?|"
+    r"ddp(?:\s*\d(?:[ ._]\d)?)?|dd(?:\s*\d(?:[ ._]\d)?)?|dts(?:[ ._-]hd)?|truehd|atmos|"
+    r"yts|yify|rarbg|eztv|ettv|psa|amzn|nf|djt|edith)\b[\s._-]*)+$",
+    re.IGNORECASE,
+)
 
 
 def windows_safe_filename(name: str, max_len: int = 120) -> str:
@@ -156,6 +218,7 @@ def cleanup_query(text: str) -> str:
     t = re.sub(r"#\S+", " ", t)
     # normalize common filename separators early (so prefix stripping works even on '_' names)
     t = re.sub(r"[_\.\-]+", " ", t)
+    t = BRACKET_RELEASE_TAG_RE.sub(" ", t)
     # strip credit/uploader suffix like "ע\"י פלוני" (often appears at end)
     t = re.sub(r"(?:^|\s)ע\s*\.?\s*י\.?\s+.*$", " ", t)
     # remove common source/channel prefixes
@@ -170,9 +233,51 @@ def cleanup_query(text: str) -> str:
     t = re.sub(r"(?:^|\s)ת\s*\.?\s*מ\.?\s*(?:\s|$)", " ", t)
     t = re.sub(r"\b(mp4|mkv|avi|mov|wmv|m4v|webm)\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"[💥🔥✅⭐️]+", " ", t)
-    t = re.sub(r"\b(1080p|720p|2160p|4k|web[- ]?dl|web[- ]?rip|bluray|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|repack)\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(1080p|720p|2160p|4k|web|web[- ]?dl|web[- ]?rip|bluray|brrip|hdr|dv|x264|x265|h\.?264|h\.?265|hevc|av1|repack)\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(ac3|aac|dts|ddp(?:\d(?:\.\d)?)?|truehd|atmos)\s*\d?(?:[ ._]\d)?\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(yts|yify|rarbg|eztv|ettv|psa|amzn|nf|djt|edith)\b", " ", t, flags=re.IGNORECASE)
+    # remove trailing release-group tags like "-DJT" / " H264-DJT"
+    t = t.strip()
+    t = TRAILING_RELEASE_TOKEN_RE.sub(" ", t)
+    t = re.sub(r"(?:^|[\s._-])[A-Z]{2,6}\s*$", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
+
+def _extract_caption_title_year(caption_text: str) -> Tuple[str, Optional[int]]:
+    title = ""
+    year = extract_year(caption_text or "")
+    lines = [ln.strip(" \t-:|") for ln in (caption_text or "").splitlines()]
+
+    for line in lines:
+        if not line:
+            continue
+        m_year = YEAR_LINE_LABEL_RE.match(line)
+        if m_year:
+            try:
+                year = int(m_year.group("year"))
+            except Exception:
+                pass
+            continue
+        m_title = TITLE_LINE_LABEL_RE.match(line)
+        if m_title:
+            candidate = cleanup_query(m_title.group("title"))
+            if candidate:
+                return candidate, year
+
+    for line in lines[:6]:
+        if not line or NOISE_LINE_RE.match(line):
+            continue
+        cleaned = cleanup_query(line)
+        if not cleaned:
+            continue
+        letters = re.findall(r"[A-Za-z\u0590-\u05ff]", cleaned)
+        if len(letters) < 3:
+            continue
+        title = cleaned
+        break
+
+    return title, year
 
 
 def parse_tv(text: str) -> Optional[Tuple[str, int, int]]:
@@ -214,6 +319,9 @@ def tv_filename(show: str, season: int, episode: int, ext: str) -> str:
 
 
 def tmdb_get(endpoint: str, params: dict) -> Optional[dict]:
+    if not TMDB_API_KEY:
+        log_print("TMDB disabled: missing SABONIPLEX_TMDB_API_KEY")
+        return None
     url = f"https://api.themoviedb.org/3/{endpoint}"
     params = dict(params)
     params["api_key"] = TMDB_API_KEY
@@ -366,6 +474,7 @@ def tmdb_find_movie(query: str) -> Optional[Dict[str, Any]]:
 
     return {
         "en_title": en_title,
+        "original_title": details_en.get("original_title") or best.get("original_title") or "",
         "year": yy,
         "he_title": he_title,
         "movie_id": movie_id,
@@ -373,6 +482,319 @@ def tmdb_find_movie(query: str) -> Optional[Dict[str, Any]]:
         "original_language": original_language,
         "production_countries": production_countries,
     }
+
+
+def _looks_like_hebrew(text: str) -> bool:
+    return bool(re.search(r"[\u0590-\u05ff]", text or ""))
+
+
+def _looks_kids_by_text(text: str) -> bool:
+    t = (text or "").lower()
+    kids_keywords = ["kids", "kid", "family", "animation", "pixar", "disney", "ילדים", "אנימציה", "משפחה", "דיסני", "פיקסאר"]
+    return any(k in t for k in kids_keywords)
+
+
+def _looks_israeli_by_text(text: str) -> bool:
+    t = (text or "").lower()
+    # "Hebrew"/"עברית" often means subtitle language, not Israeli production.
+    return any(k in t for k in ["ישראלי", "israeli", "סרט ישראלי", "הפקה ישראלית"])
+
+
+def _append_decision_log(payload: Dict[str, Any]):
+    try:
+        rec = dict(payload)
+        rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(DECISIONS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _append_move_action(payload: Dict[str, Any]):
+    try:
+        rec = dict(payload)
+        rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(MOVE_ACTIONS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def undo_last_move() -> bool:
+    try:
+        if not os.path.exists(MOVE_ACTIONS_LOG_PATH):
+            return False
+        with open(MOVE_ACTIONS_LOG_PATH, "r", encoding="utf-8") as f:
+            rows = [ln.strip() for ln in f if ln.strip()]
+        if not rows:
+            return False
+        last = json.loads(rows[-1])
+        if last.get("action") != "move":
+            return False
+        src = str(last.get("src") or "")
+        dst = str(last.get("dst") or "")
+        if not src or not dst or not os.path.exists(dst):
+            return False
+        parent = os.path.dirname(src)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.move(dst, src)
+        _append_move_action({"action": "undo_move", "src": src, "dst": dst, "status": "ok"})
+        return True
+    except Exception:
+        return False
+
+
+def _candidate_queries(filename_text: str, caption_text: str) -> List[str]:
+    out: List[str] = []
+    title_from_caption, year_from_caption = _extract_caption_title_year(caption_text or "")
+    if title_from_caption:
+        out.append(f"{title_from_caption} {year_from_caption}".strip() if year_from_caption else title_from_caption)
+        out.append(title_from_caption)
+    for raw in [caption_text or "", filename_text or ""]:
+        cleaned = cleanup_query(strip_known_ext(raw))
+        if cleaned:
+            out.append(cleaned)
+        if raw:
+            out.append(strip_known_ext(raw).strip())
+    dedup: List[str] = []
+    seen = set()
+    for v in out:
+        key = (v or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(v.strip())
+    return dedup
+
+
+def _ai_extract_json_text(txt: str) -> Optional[Dict[str, Any]]:
+    if not txt:
+        return None
+    try:
+        m = re.search(r"\{.*\}", txt, flags=re.S)
+        payload = json.loads(m.group(0) if m else txt)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _ai_completion_json(prompt: str, *, max_tokens: int = 220) -> Optional[Dict[str, Any]]:
+    if GROQ_API_KEY:
+        try:
+            r = _tmdb_session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "Return JSON only, no markdown."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": int(max_tokens),
+                },
+                timeout=GROQ_TIMEOUT_SEC,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                txt = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+                payload = _ai_extract_json_text(txt)
+                if payload:
+                    return payload
+                log_print("AI Groq returned non-JSON response")
+            else:
+                log_print(f"AI Groq error {r.status_code}: {r.text[:220]}")
+        except Exception as ex:
+            log_print(f"AI Groq error: {ex}")
+
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        r = _tmdb_session.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": OPENAI_MODEL, "input": prompt, "max_output_tokens": int(max_tokens), "temperature": 0},
+            timeout=OPENAI_TIMEOUT_SEC,
+        )
+        if r.status_code != 200:
+            log_print(f"AI OpenAI error {r.status_code}: {r.text[:220]}")
+            return None
+        data = r.json()
+        txt = data.get("output_text") or ""
+        payload = _ai_extract_json_text(txt)
+        if payload:
+            return payload
+        log_print("AI OpenAI returned non-JSON response")
+    except Exception as ex:
+        log_print(f"AI OpenAI error: {ex}")
+        return None
+    return None
+
+
+def _ai_guess_movie_query(filename_text: str, caption_text: str) -> Optional[str]:
+    prompt = (
+        "Extract a likely MOVIE title query for TMDB from noisy Telegram text.\n"
+        "Return JSON only: {\"query\":\"...\",\"year\":\"... or empty\"}.\n"
+        "If this looks like TV episode data return empty query.\n"
+        f"filename: {filename_text}\n"
+        f"caption: {caption_text}\n"
+    )
+    try:
+        payload = _ai_completion_json(prompt, max_tokens=120) or {}
+        q = (payload.get("query") or "").strip()
+        y = (payload.get("year") or "").strip()
+        if not q:
+            return None
+        if y and re.fullmatch(r"(19\d{2}|20\d{2})", y):
+            return f"{q} {y}".strip()
+        return q
+    except Exception:
+        return None
+
+
+def _ai_resolve_media_metadata(filename_text: str, caption_text: str) -> Optional[Dict[str, Any]]:
+    prompt = (
+        "You classify one Telegram media item for Plex.\n"
+        "Return JSON only with keys:\n"
+        "{\"kind\":\"movie|series|unknown\",\"title_query\":\"...\",\"year\":\"YYYY or empty\","
+        "\"season\":0,\"episode\":0,\"is_kids\":true|false,\"is_israeli\":true|false,\"confidence\":0..1}\n"
+        "Use kind=series only when episode markers are clear, and then include season/episode numbers.\n"
+        f"filename: {filename_text}\n"
+        f"caption: {caption_text}\n"
+    )
+    payload = _ai_completion_json(prompt, max_tokens=180)
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("kind") or "unknown").strip().lower()
+    if kind not in {"movie", "series", "unknown"}:
+        kind = "unknown"
+    title_query = str(payload.get("title_query") or "").strip()
+    year = str(payload.get("year") or "").strip()
+    if year and not re.fullmatch(r"(19\d{2}|20\d{2})", year):
+        year = ""
+    try:
+        conf = float(payload.get("confidence"))
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    try:
+        season = max(0, int(payload.get("season") or 0))
+    except Exception:
+        season = 0
+    try:
+        episode = max(0, int(payload.get("episode") or 0))
+    except Exception:
+        episode = 0
+    return {
+        "kind": kind,
+        "title_query": title_query,
+        "year": year,
+        "season": season,
+        "episode": episode,
+        "is_kids": bool(payload.get("is_kids")),
+        "is_israeli": bool(payload.get("is_israeli")),
+        "confidence": conf,
+    }
+
+
+def tmdb_find_movie_smart(filename_text: str, caption_text: str) -> Optional[Dict[str, Any]]:
+    candidates = _candidate_queries(filename_text, caption_text)
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+
+    for q in candidates:
+        found = tmdb_find_movie(q)
+        if not found:
+            continue
+        cleaned_q = cleanup_query(q)
+        score = max(
+            _similarity(cleaned_q, found.get("en_title") or ""),
+            _similarity(cleaned_q, found.get("he_title") or ""),
+            _similarity(cleaned_q, found.get("original_title") or ""),
+        )
+        query_year = extract_year(q)
+        if query_year and str(found.get("year") or "").strip() == str(query_year):
+            score += 0.12
+        if score > best_score:
+            best_score = score
+            best = found
+        if score >= 0.90:
+            return found
+
+    if best:
+        return best
+
+    ai_q = _ai_guess_movie_query(filename_text, caption_text)
+    if ai_q:
+        found = tmdb_find_movie(ai_q)
+        if found:
+            found = dict(found)
+            found["_ai_query_used"] = True
+        return found
+    return None
+
+
+def _classify_movie_root_with_reason(found: Optional[Dict[str, Any]], combined_text: str) -> Tuple[str, str, float]:
+    if found:
+        root = pick_movie_root(found, combined_text)
+        if root == KIDS_MOVIES_DIR:
+            return root, "tmdb_genre_or_kids_keyword", 0.92
+        if root == ISRAELI_MOVIES_DIR:
+            return root, "tmdb_country_or_language", 0.93
+        return root, "tmdb_movie_default", 0.88
+
+    if _looks_kids_by_text(combined_text):
+        return KIDS_MOVIES_DIR, "fallback_kids_keywords", 0.66
+    if _looks_israeli_by_text(combined_text):
+        return ISRAELI_MOVIES_DIR, "fallback_israeli_keywords", 0.67
+    # Hebrew text alone is common in captions/subtitle notes and should not force Israeli folder.
+    if _looks_like_hebrew(combined_text):
+        return MOVIES_DIR, "fallback_hebrew_text_non_israeli", 0.56
+    return MOVIES_DIR, "fallback_default_movies", 0.55
+
+
+def _classify_movie_root_with_ai_hint(
+    found: Optional[Dict[str, Any]],
+    combined_text: str,
+    ai_meta: Optional[Dict[str, Any]],
+) -> Tuple[str, str, float]:
+    if found:
+        return _classify_movie_root_with_reason(found, combined_text)
+    if ai_meta and float(ai_meta.get("confidence") or 0.0) >= 0.70:
+        if ai_meta.get("is_kids"):
+            return KIDS_MOVIES_DIR, "ai_hint_kids", 0.78
+        if ai_meta.get("is_israeli"):
+            return ISRAELI_MOVIES_DIR, "ai_hint_israeli", 0.79
+    return _classify_movie_root_with_reason(None, combined_text)
+
+
+def _load_overrides() -> List[Dict[str, Any]]:
+    try:
+        if not os.path.exists(OVERRIDES_PATH):
+            return []
+        with open(OVERRIDES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+    except Exception:
+        return []
+
+
+def _match_override(combined_text: str) -> Optional[Dict[str, Any]]:
+    text = cleanup_query(combined_text or "").lower()
+    if not text:
+        return None
+    for item in _load_overrides():
+        pattern = str(item.get("match") or "").strip().lower()
+        if not pattern:
+            continue
+        if pattern in text:
+            return item
+    return None
 
 
 def pick_movie_root(found: Dict[str, Any], raw_text: str) -> str:
@@ -394,6 +816,14 @@ def pick_movie_root(found: Dict[str, Any], raw_text: str) -> str:
         return ISRAELI_MOVIES_DIR
 
     return MOVIES_DIR
+
+
+def plex_movie_name(en_title: str, year: str, movie_id: Optional[int], with_tmdb_tag: bool) -> str:
+    base = f"{en_title} ({year})" if (en_title and year) else (en_title or "")
+    base = windows_safe_filename(base, 120)
+    if with_tmdb_tag and movie_id:
+        return windows_safe_filename(f"{base} {{tmdb-{int(movie_id)}}}", 120)
+    return base
 
 
 def tmdb_find_tv(query: str) -> Optional[str]:
@@ -445,7 +875,12 @@ def tmdb_find_tv(query: str) -> Optional[str]:
     return None
 
 
-def plex_move(src_path: str, original_name: str, caption_text: Optional[str] = None) -> Optional[str]:
+def plex_move(src_path: str, original_name: str, caption_text: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    settings = load_settings()
+    dry_run = bool(settings.get("dry_run"))
+    dedupe_by_size = bool(settings.get("dedupe_by_size", True))
+    use_tmdb_id_tag = bool(settings.get("plex_use_tmdb_id_tag", True))
+    strict_tmdb_match = bool(settings.get("strict_tmdb_match", True))
     base = os.path.basename(original_name or os.path.basename(src_path))
 
     # extension should follow the actual file on disk
@@ -472,39 +907,272 @@ def plex_move(src_path: str, original_name: str, caption_text: Optional[str] = N
 
     display_name: Optional[str] = None
 
+    decision: Dict[str, Any] = {
+        "source_path": src_path,
+        "original_name": original_name,
+        "caption_text": caption_text or "",
+        "kind": "",
+        "tmdb_used": False,
+        "ai_used": False,
+        "ai_confidence": 0.0,
+        "confidence": 0.0,
+        "reason": "",
+        "dest_path": "",
+    }
+
     if tv_info:
         show_guess, season, episode = tv_info
         # Prefer TMDB lookup by the parsed show name only (avoids matching on promo/caption noise).
-        show = tmdb_find_tv(show_guess) or tmdb_find_tv(tv_query_text) or show_guess
+        show_tmdb = tmdb_find_tv(show_guess) or tmdb_find_tv(tv_query_text)
+        show = show_tmdb or show_guess
         show = windows_safe_filename(show or show_guess, 80)
         dest_dir = os.path.join(TV_DIR, show, season_folder_name(season))
         os.makedirs(dest_dir, exist_ok=True)
         final_name = windows_safe_filename(tv_filename(show, season, episode, ext), 140)
         display_name = strip_known_ext(final_name)
         out_path = ensure_unique(os.path.join(dest_dir, final_name))
+        decision.update(
+            {
+                "kind": "series",
+                "tmdb_used": bool(show_tmdb),
+                "confidence": 0.92 if show_tmdb else 0.78,
+                "reason": "parsed_season_episode",
+                "series_name": show,
+                "season": season,
+                "episode": episode,
+            }
+        )
     else:
-        found = tmdb_find_movie(cleanup_query(raw_text) or raw_text)
-        if found:
-            en_title = windows_safe_filename(found.get("en_title") or "", 110)
-            yy = (found.get("year") or "").strip()
-            nice = f"{en_title} ({yy})" if (en_title and yy) else (en_title or windows_safe_filename(cleanup_query(raw_text) or raw_text, 120))
-        else:
-            cleaned = cleanup_query(raw_text) or raw_text
-            y = extract_year(cleaned)
-            name_wo_year = YEAR_RE.sub("", cleaned).strip()
-            if y and name_wo_year:
-                nice = windows_safe_filename(f"{name_wo_year} ({y})", 120)
+        mix = f"{raw_text} {caption_raw}".strip()
+        ov = _match_override(mix)
+        if ov:
+            kind = str(ov.get("kind") or "").strip().lower()
+            forced_name = windows_safe_filename(str(ov.get("name") or "").strip(), 120) or "Unknown"
+            forced_year = str(ov.get("year") or "").strip()
+            if kind == "series":
+                season = int(ov.get("season") or 1)
+                episode = int(ov.get("episode") or 1)
+                show = windows_safe_filename(forced_name, 80)
+                dest_dir = os.path.join(TV_DIR, show, season_folder_name(season))
+                os.makedirs(dest_dir, exist_ok=True)
+                final_name = windows_safe_filename(tv_filename(show, season, episode, ext), 140)
+                display_name = strip_known_ext(final_name)
+                out_path = ensure_unique(os.path.join(dest_dir, final_name))
+                decision.update(
+                    {
+                        "kind": "series",
+                        "tmdb_used": False,
+                        "confidence": 0.99,
+                        "reason": "override_series",
+                        "series_name": show,
+                        "season": season,
+                        "episode": episode,
+                    }
+                )
             else:
-                nice = windows_safe_filename(cleaned, 120)
+                nice = f"{forced_name} ({forced_year})" if forced_year else forced_name
+                root_key = str(ov.get("root") or "movies").strip().lower()
+                if root_key == "kids":
+                    root_dir = KIDS_MOVIES_DIR
+                elif root_key == "israeli":
+                    root_dir = ISRAELI_MOVIES_DIR
+                elif root_key == "series":
+                    root_dir = TV_DIR
+                else:
+                    root_dir = MOVIES_DIR
+                movie_folder = os.path.join(root_dir, nice)
+                os.makedirs(movie_folder, exist_ok=True)
+                out_path = ensure_unique(os.path.join(movie_folder, f"{nice}{ext}"))
+                display_name = nice
+                decision.update(
+                    {
+                        "kind": "movie",
+                        "tmdb_used": False,
+                        "confidence": 0.99,
+                        "reason": "override_movie",
+                        "movie_name": nice,
+                        "movie_year": forced_year,
+                    }
+                )
+            found = None
+        else:
+            found = tmdb_find_movie_smart(raw_text, caption_raw)
+            ai_meta = None
+            ai_series_handled = False
+            if found and found.get("_ai_query_used"):
+                decision["ai_used"] = True
+            if not found:
+                ai_meta = _ai_resolve_media_metadata(raw_text, caption_raw)
+                if ai_meta:
+                    decision["ai_used"] = True
+                    decision["ai_confidence"] = float(ai_meta.get("confidence") or 0.0)
+                ai_q = ""
+                if ai_meta:
+                    ai_q = str(ai_meta.get("title_query") or "").strip()
+                    ai_y = str(ai_meta.get("year") or "").strip()
+                    if ai_q and ai_y and re.fullmatch(r"(19\d{2}|20\d{2})", ai_y):
+                        ai_q = f"{ai_q} {ai_y}".strip()
+                if ai_meta and ai_meta.get("kind") == "series":
+                    ai_conf = float(ai_meta.get("confidence") or 0.0)
+                    season = int(ai_meta.get("season") or 0)
+                    episode = int(ai_meta.get("episode") or 0)
+                    show_guess = windows_safe_filename(str(ai_meta.get("title_query") or "").strip(), 80)
+                    if ai_conf >= 0.86 and show_guess and season > 0 and episode > 0:
+                        show_tmdb = tmdb_find_tv(show_guess) or show_guess
+                        show = windows_safe_filename(show_tmdb or show_guess, 80)
+                        dest_dir = os.path.join(TV_DIR, show, season_folder_name(season))
+                        os.makedirs(dest_dir, exist_ok=True)
+                        final_name = windows_safe_filename(tv_filename(show, season, episode, ext), 140)
+                        display_name = strip_known_ext(final_name)
+                        out_path = ensure_unique(os.path.join(dest_dir, final_name))
+                        decision.update(
+                            {
+                                "kind": "series",
+                                "tmdb_used": bool(show_tmdb and show_tmdb != show_guess),
+                                "ai_used": True,
+                                "ai_confidence": ai_conf,
+                                "confidence": 0.84,
+                                "reason": "ai_series_episode",
+                                "series_name": show,
+                                "season": season,
+                                "episode": episode,
+                            }
+                        )
+                        ai_series_handled = True
+                if ai_q and not ai_series_handled:
+                    found = tmdb_find_movie(ai_q)
 
-        display_name = nice
+            if ai_series_handled:
+                pass
+            elif found:
+                en_title = windows_safe_filename(found.get("en_title") or "", 110)
+                yy = (found.get("year") or "").strip()
+                movie_id = found.get("movie_id")
+                nice = plex_movie_name(en_title, yy, movie_id, use_tmdb_id_tag)
+                if not nice:
+                    nice = windows_safe_filename(cleanup_query(raw_text) or raw_text, 120)
+            else:
+                cleaned = cleanup_query(raw_text) or raw_text
+                # In strict mode, unresolved TMDB match is routed to review queue
+                # instead of polluting the library with guessed names.
+                if strict_tmdb_match:
+                    review_base = windows_safe_filename(cleaned, 120) or "Unknown Movie"
+                    nice = review_base
+                    ai_conf = float((ai_meta or {}).get("confidence") or 0.0)
+                    movie_folder = os.path.join(NEEDS_REVIEW_DIR, nice)
+                    os.makedirs(movie_folder, exist_ok=True)
+                    out_path = ensure_unique(os.path.join(movie_folder, f"{nice}{ext}"))
+                    display_name = nice
+                    decision.update(
+                        {
+                            "kind": "movie",
+                            "tmdb_used": False,
+                            "ai_used": bool(ai_meta),
+                            "ai_confidence": ai_conf,
+                            "confidence": max(0.20, min(0.69, ai_conf)),
+                            "reason": str(decision.get("reason") or "strict_tmdb_no_match_needs_review"),
+                            "movie_name": nice,
+                            "movie_year": "",
+                            "movie_id": None,
+                        }
+                    )
+                else:
+                    y = extract_year(cleaned)
+                    name_wo_year = YEAR_RE.sub("", cleaned).strip()
+                    if y and name_wo_year:
+                        nice = windows_safe_filename(f"{name_wo_year} ({y})", 120)
+                    else:
+                        nice = windows_safe_filename(cleaned, 120)
 
-        root_dir = pick_movie_root(found, raw_text) if found else MOVIES_DIR
-        movie_folder = os.path.join(root_dir, nice)
-        os.makedirs(movie_folder, exist_ok=True)
-        out_path = ensure_unique(os.path.join(movie_folder, f"{nice}{ext}"))
+            if ai_series_handled:
+                pass
+            elif found:
+                display_name = nice
+                root_dir, reason, conf = _classify_movie_root_with_reason(found, mix)
+                movie_folder = os.path.join(root_dir, nice)
+                os.makedirs(movie_folder, exist_ok=True)
+                out_path = ensure_unique(os.path.join(movie_folder, f"{nice}{ext}"))
+                decision.update(
+                    {
+                        "kind": "movie",
+                        "tmdb_used": True,
+                        "confidence": conf,
+                        "reason": reason,
+                        "movie_name": nice,
+                        "movie_year": (found.get("year") if found else "") or "",
+                        "movie_id": (found.get("movie_id") if found else None),
+                        "ai_used": bool(ai_meta) or bool(found.get("_ai_query_used")),
+                        "ai_confidence": float((ai_meta or {}).get("confidence") or 0.0),
+                    }
+                )
+            elif not strict_tmdb_match:
+                display_name = nice
+                root_dir, reason, conf = _classify_movie_root_with_ai_hint(None, mix, ai_meta)
+                movie_folder = os.path.join(root_dir, nice)
+                os.makedirs(movie_folder, exist_ok=True)
+                out_path = ensure_unique(os.path.join(movie_folder, f"{nice}{ext}"))
+                decision.update(
+                    {
+                        "kind": "movie",
+                        "tmdb_used": False,
+                        "confidence": conf,
+                        "reason": f"{reason}_no_tmdb",
+                        "movie_name": nice,
+                        "movie_year": "",
+                        "movie_id": None,
+                        "ai_used": bool(ai_meta),
+                        "ai_confidence": float((ai_meta or {}).get("confidence") or 0.0),
+                    }
+                )
 
     try:
+        if dedupe_by_size and os.path.exists(src_path):
+            try:
+                src_size = int(os.path.getsize(src_path))
+            except Exception:
+                src_size = 0
+            if src_size > 0:
+                target_folder = os.path.dirname(out_path)
+                if os.path.isdir(target_folder):
+                    for n in os.listdir(target_folder):
+                        cand = os.path.join(target_folder, n)
+                        if not os.path.isfile(cand):
+                            continue
+                        try:
+                            if int(os.path.getsize(cand)) == src_size:
+                                decision["reason"] = str(decision.get("reason") or "") + "|dedupe_size_match"
+                                decision["dest_path"] = cand
+                                decision["status"] = "duplicate"
+                                _append_decision_log(decision)
+                                return {
+                                    "display_name": display_name,
+                                    "reason": decision.get("reason"),
+                                    "confidence": decision.get("confidence"),
+                                    "kind": decision.get("kind"),
+                                    "dest_path": cand,
+                                    "tmdb_used": decision.get("tmdb_used"),
+                                    "ai_used": decision.get("ai_used"),
+                                    "ai_confidence": decision.get("ai_confidence"),
+                                }
+                        except Exception:
+                            pass
+
+        if dry_run:
+            decision["status"] = "dry_run"
+            decision["dest_path"] = out_path
+            _append_decision_log(decision)
+            _append_move_action({"action": "dry_run", "src": src_path, "dst": out_path, "status": "ok"})
+            return {
+                "display_name": display_name,
+                "reason": str(decision.get("reason") or "") + "|dry_run",
+                "confidence": decision.get("confidence"),
+                "kind": decision.get("kind"),
+                "dest_path": out_path,
+                "tmdb_used": decision.get("tmdb_used"),
+                "ai_used": decision.get("ai_used"),
+                "ai_confidence": decision.get("ai_confidence"),
+            }
+
         moved = False
         for _ in range(3):
             try:
@@ -518,11 +1186,28 @@ def plex_move(src_path: str, original_name: str, caption_text: Optional[str] = N
             raise PermissionError("File locked during move")
 
         log_print(f"Plex ✅ {out_path}")
-        return display_name
+        decision["dest_path"] = out_path
+        decision["status"] = "ok"
+        _append_decision_log(decision)
+        _append_move_action({"action": "move", "src": src_path, "dst": out_path, "status": "ok"})
+        return {
+            "display_name": display_name,
+            "reason": decision.get("reason"),
+            "confidence": decision.get("confidence"),
+            "kind": decision.get("kind"),
+            "dest_path": out_path,
+            "tmdb_used": decision.get("tmdb_used"),
+            "ai_used": decision.get("ai_used"),
+            "ai_confidence": decision.get("ai_confidence"),
+        }
     except Exception as e:
         log_print(f"MOVE ERROR: {e}")
         log_print(f"SRC: {src_path}")
         log_print(f"DST: {out_path}")
+        decision["dest_path"] = out_path
+        decision["status"] = "error"
+        decision["error"] = str(e)
+        _append_decision_log(decision)
         return None
 
 
@@ -687,11 +1372,15 @@ def main():
     active = {}
     download_queue = []   # queue of file_ids
 
-    # Concurrency: allow multiple downloads in parallel.
+    # Concurrency modes:
+    # - single (default): maximize speed for a single file
+    # - throughput: maximize total throughput
+    speed_mode = (os.environ.get("SABONIPLEX_SPEED_MODE", "single") or "single").strip().lower()
+    default_concurrency = 1 if speed_mode == "single" else 10
     try:
-        v = int(os.environ.get("SABONIPLEX_MAX_CONCURRENT_DOWNLOADS", "10"))
+        v = int(os.environ.get("SABONIPLEX_MAX_CONCURRENT_DOWNLOADS", str(default_concurrency)))
     except Exception:
-        v = 10
+        v = default_concurrency
     max_concurrent_downloads = max(1, min(12, v))
 
     downloading = set()  # file_ids started and not yet completed

@@ -16,7 +16,9 @@ from tdlib_saboniplex_maxspeed import (
     td_execute,
     plex_move,
     set_ui_sinks,
+    undo_last_move,
 )
+from saboniplex_settings import load_settings
 
 
 @dataclass
@@ -32,6 +34,12 @@ class DownloadItem:
     is_paused: bool = False
     local_path: str = ""
     created_ts: float = 0.0
+    classify_reason: str = ""
+    classify_confidence: float = 0.0
+    classify_dest_path: str = ""
+    classify_tmdb_used: bool = False
+    classify_ai_used: bool = False
+    classify_ai_confidence: float = 0.0
 
 
 class TdlibDownloadWorker(threading.Thread):
@@ -51,7 +59,10 @@ class TdlibDownloadWorker(threading.Thread):
         super().__init__(daemon=True)
         self._ev = event_queue
         self._cmd = command_queue
-        self._group_title = group_title
+        self._settings = load_settings()
+        self._group_titles = self._settings.get("group_titles") or [group_title]
+        self._group_chat_ids = [int(x) for x in (self._settings.get("group_chat_ids") or []) if str(x).strip()]
+        self._group_title = self._group_titles[0]
 
         self._stop = threading.Event()
         self._client_id: Optional[int] = None
@@ -59,13 +70,20 @@ class TdlibDownloadWorker(threading.Thread):
         self._auth_waiting_for: Optional[str] = None  # phone|code|password
 
         self._chat_id: Optional[int] = None
+        self._chat_ids: set[int] = set()
         self._listening_enabled = False
         self._paused_all = True
-        self._desired_running = False
+        self._desired_running = True
 
         self._items: Dict[int, DownloadItem] = {}
         self._queue: List[int] = []
         self._current: Optional[int] = None
+        self._seen_message_ids: set[int] = set()
+        self._last_history_sync_ts: float = 0.0
+        self._history_bootstrap_pending: bool = True
+        self._history_bootstrap_started_at: float = 0.0
+        self._min_message_id_to_accept: int = 0
+        self._accept_recent_seconds = int(self._settings.get("accept_recent_seconds", 300))
 
         self._last_bytes: Dict[int, int] = {}
         # _last_time: last time we observed *progress* (downloaded_size increased)
@@ -86,12 +104,10 @@ class TdlibDownloadWorker(threading.Thread):
         self._postprocess_lock = threading.Lock()
 
         # Concurrency: TDLib can download multiple files in parallel.
-        # Default to 10 to improve throughput on connections where a single download is throttled.
-        try:
-            v = int(os.environ.get("SABONIPLEX_MAX_CONCURRENT_DOWNLOADS", "10"))
-        except Exception:
-            v = 10
-        self._max_concurrent_downloads = max(1, min(12, v))
+        # Modes:
+        # - throughput (default): maximize total throughput
+        # - single: maximize speed for a single file
+        self._max_concurrent_downloads = int(self._settings.get("max_concurrent_downloads", 1))
 
     # ----------------- helpers -----------------
     def _emit(self, typ: str, **payload: Any):
@@ -144,9 +160,31 @@ class TdlibDownloadWorker(threading.Thread):
             return
         td_send(self._client_id, {"@type": "getFile", "file_id": int(file_id)})
 
+    def _request_history_sync(self, limit: int = 30):
+        if not self._client_id or not self._chat_id:
+            return
+        td_send(
+            self._client_id,
+            {
+                "@type": "getChatHistory",
+                "chat_id": int(self._chat_id),
+                "from_message_id": 0,
+                "offset": 0,
+                "limit": int(max(1, min(100, limit))),
+                "only_local": False,
+            },
+        )
+        self._last_history_sync_ts = time.time()
+
     def _start_listening(self):
         if not self._client_id or not self._chat_id:
             return
+        # Build a "start line": only messages newer than the latest current message
+        # should be downloaded. This prevents re-downloading old group media.
+        self._history_bootstrap_pending = True
+        self._history_bootstrap_started_at = time.time()
+        self._min_message_id_to_accept = 0
+        self._request_history_sync(limit=1)
         td_send(self._client_id, {"@type": "setOption", "name": "online", "value": {"@type": "optionValueBoolean", "value": True}})
         td_send(self._client_id, {"@type": "openChat", "chat_id": int(self._chat_id)})
         self._listening_enabled = True
@@ -156,9 +194,62 @@ class TdlibDownloadWorker(threading.Thread):
         self._listening_enabled = False
         self._emit("engine_state", state="not_listening")
 
+    def _emit_health(self):
+        active = self._active_download_count()
+        queued = sum(1 for fid in self._queue if fid in self._items)
+        self._emit(
+            "health",
+            chat_ids=sorted(list(self._chat_ids)),
+            listening=self._listening_enabled,
+            active_downloads=active,
+            queued_items=queued,
+            total_items=len(self._items),
+            last_history_sync_ts=self._last_history_sync_ts,
+            bootstrap_pending=self._history_bootstrap_pending,
+        )
+
+    @staticmethod
+    def _normalize_chat_title(txt: str) -> str:
+        x = str(txt or "").strip().lower()
+        x = " ".join(x.split())
+        return x
+
+    def _title_matches(self, expected: str, actual: str) -> bool:
+        e = self._normalize_chat_title(expected)
+        a = self._normalize_chat_title(actual)
+        if not e or not a:
+            return False
+        if a == e:
+            return True
+        # Accept contains match for cases with emoji/prefix/suffix in Telegram title.
+        return (e in a) or (a in e)
+
     def _find_chat_id_by_title(self, title: str) -> Optional[int]:
         if not self._client_id:
             return None
+
+        # First try TDLib search (more reliable than top-N main list).
+        try:
+            td_send(self._client_id, {"@type": "searchChats", "query": str(title), "limit": 50})
+            deadline0 = time.time() + 5
+            while time.time() < deadline0 and not self._stop.is_set():
+                r0 = td_receive(0.4)
+                if not r0:
+                    continue
+                if r0.get("@type") == "chats":
+                    for cid in (r0.get("chat_ids") or []):
+                        td_send(self._client_id, {"@type": "getChat", "chat_id": int(cid)})
+                        deadlinex = time.time() + 1.5
+                        while time.time() < deadlinex and not self._stop.is_set():
+                            rx = td_receive(0.3)
+                            if not rx:
+                                continue
+                            if rx.get("@type") == "chat" and rx.get("id") == cid:
+                                if self._title_matches(title, rx.get("title") or ""):
+                                    return int(cid)
+                                break
+        except Exception:
+            pass
 
         td_send(self._client_id, {"@type": "getChats", "chat_list": {"@type": "chatListMain"}, "limit": 200})
         deadline = time.time() + 10
@@ -180,7 +271,7 @@ class TdlibDownloadWorker(threading.Thread):
                 if not r2:
                     continue
                 if r2.get("@type") == "chat" and r2.get("id") == cid:
-                    if (r2.get("title") or "") == title:
+                    if self._title_matches(title, r2.get("title") or ""):
                         return int(cid)
                     break
         return None
@@ -241,6 +332,12 @@ class TdlibDownloadWorker(threading.Thread):
             speed=f"{speed_mb:.2f} MB/s" if speed_mb > 0 else "0.00 MB/s",
             eta=eta_txt,
             queue_pos=(self._queue.index(it.file_id) + 1) if it.file_id in self._queue else (1 if it.file_id == self._current else ""),
+            classify_reason=it.classify_reason,
+            classify_confidence=it.classify_confidence,
+            classify_dest_path=it.classify_dest_path,
+            classify_tmdb_used=it.classify_tmdb_used,
+            classify_ai_used=it.classify_ai_used,
+            classify_ai_confidence=it.classify_ai_confidence,
         )
 
     def _maybe_start_next(self):
@@ -335,6 +432,35 @@ class TdlibDownloadWorker(threading.Thread):
         self._emit_item(it.file_id)
         self._maybe_start_next()
 
+    def _extract_media_from_message(self, msg: dict) -> Optional[tuple[int, str, str]]:
+        content = msg.get("content") or {}
+        ctype = content.get("@type")
+        file_obj = None
+        suggested = None
+        caption_text = ""
+
+        cap = content.get("caption") or {}
+        if isinstance(cap, dict):
+            caption_text = str(cap.get("text") or "")
+
+        if ctype == "messageDocument":
+            doc = content.get("document") or {}
+            file_obj = doc.get("document")
+            suggested = (doc.get("file_name") or "video")
+        elif ctype == "messageVideo":
+            vid = content.get("video") or {}
+            file_obj = vid.get("video")
+            suggested = (vid.get("file_name") or "video")
+        else:
+            return None
+
+        if not file_obj:
+            return None
+        file_id = file_obj.get("id")
+        if not file_id:
+            return None
+        return int(file_id), str(suggested), caption_text
+
     def _handle_update_file(self, f: dict):
         file_id = f.get("id")
         if not file_id:
@@ -403,9 +529,26 @@ class TdlibDownloadWorker(threading.Thread):
             try:
                 src = it.local_path
                 if src and os.path.exists(src):
-                    official_name = plex_move(src, it.name, it.caption)
-                    if official_name:
-                        it.name = str(official_name)
+                    move_result = plex_move(src, it.name, it.caption)
+                    if move_result:
+                        if isinstance(move_result, dict):
+                            it.name = str(move_result.get("display_name") or it.name)
+                            it.classify_reason = str(move_result.get("reason") or "")
+                            try:
+                                it.classify_confidence = float(move_result.get("confidence") or 0.0)
+                            except Exception:
+                                it.classify_confidence = 0.0
+                            it.classify_dest_path = str(move_result.get("dest_path") or "")
+                            it.classify_tmdb_used = bool(move_result.get("tmdb_used"))
+                            it.classify_ai_used = bool(move_result.get("ai_used"))
+                            try:
+                                it.classify_ai_confidence = float(move_result.get("ai_confidence") or 0.0)
+                            except Exception:
+                                it.classify_ai_confidence = 0.0
+                            if it.classify_dest_path:
+                                it.local_path = it.classify_dest_path
+                        else:
+                            it.name = str(move_result)
                         it.status = "Completed"
                     else:
                         it.status = "Error"
@@ -442,6 +585,7 @@ class TdlibDownloadWorker(threading.Thread):
                 self._stall_last_action.pop(fid, None)
 
             self._emit("items_removed", file_ids=to_remove)
+            self._emit_health()
             return
 
         if c == "shutdown":
@@ -454,6 +598,7 @@ class TdlibDownloadWorker(threading.Thread):
             if self._chat_id:
                 self._start_listening()
             self._maybe_start_next()
+            self._emit_health()
             return
 
         if c == "stop_all":
@@ -467,6 +612,43 @@ class TdlibDownloadWorker(threading.Thread):
                     it.status = "Paused"
                     self._emit_item(fid)
             self._current = None
+            self._emit_health()
+            return
+
+        if c == "retry_failed":
+            retried = []
+            for fid, it in self._items.items():
+                if it.status != "Error":
+                    continue
+                it.status = "Queued"
+                it.is_paused = False
+                if fid not in self._queue:
+                    self._queue.append(fid)
+                retried.append(fid)
+                self._emit_item(fid)
+            self._maybe_start_next()
+            if retried:
+                self._emit("log", message=f"retried {len(retried)} failed items")
+            self._emit_health()
+            return
+
+        if c == "reprocess_item":
+            try:
+                fid = int(cmd.get("file_id"))
+            except Exception:
+                return
+            it = self._items.get(fid)
+            if not it:
+                return
+            it.status = "Moving"
+            it.is_paused = False
+            self._emit_item(fid)
+            self._start_postprocess(fid)
+            return
+
+        if c == "undo_last_move":
+            ok = undo_last_move()
+            self._emit("log", message="undo last move: ok" if ok else "undo last move: none/failed")
             return
 
         if c == "auth_phone":
@@ -559,17 +741,28 @@ class TdlibDownloadWorker(threading.Thread):
 
             # resolve chat id once
             self._emit("engine_state", state="finding_chat")
-            cid = self._find_chat_id_by_title(self._group_title)
-            if not cid:
-                self._emit("engine_state", state="error", message=f'Chat "{self._group_title}" not found')
+            found: Dict[str, int] = {}
+            if self._group_chat_ids:
+                for cid in self._group_chat_ids:
+                    found[f"id:{cid}"] = int(cid)
+            else:
+                for gt in self._group_titles:
+                    cid = self._find_chat_id_by_title(str(gt))
+                    if cid:
+                        found[str(gt)] = int(cid)
+            if not found:
+                self._emit("engine_state", state="error", message=f'Chats not found: {", ".join(self._group_titles)}')
                 return
-            self._chat_id = cid
-            self._emit("engine_state", state="chat_ready", chat_id=cid)
+            self._chat_ids = set(found.values())
+            self._chat_id = next(iter(self._chat_ids))
+            self._emit("engine_state", state="chat_ready", chat_id=self._chat_id)
+            self._emit("log", message=f"chat locks: {found}")
             # apply desired running state if Start was pressed early
             if self._desired_running:
                 self._toggle_all_paused(False)
                 self._start_listening()
                 self._maybe_start_next()
+                self._emit_health()
             return
 
         if state == "authorizationStateClosed":
@@ -601,6 +794,18 @@ class TdlibDownloadWorker(threading.Thread):
                 # never let the watchdog kill the worker
                 pass
 
+            if self._authorized and self._listening_enabled and self._chat_id:
+                now = time.time()
+                if (now - self._last_history_sync_ts) >= 25.0:
+                    try:
+                        self._request_history_sync(limit=30)
+                    except Exception:
+                        pass
+                # Fallback: if baseline never arrives, unlock after timeout to avoid dead listening state.
+                if self._history_bootstrap_pending and (now - self._history_bootstrap_started_at) >= 10.0:
+                    self._history_bootstrap_pending = False
+                    self._emit("log", message="baseline timeout -> accepting new messages from now")
+
             upd = td_receive(0.2)
             if not upd:
                 continue
@@ -620,41 +825,81 @@ class TdlibDownloadWorker(threading.Thread):
                 if not self._listening_enabled or not self._chat_id:
                     continue
                 msg = upd.get("message") or {}
-                if msg.get("chat_id") != self._chat_id:
+                if msg.get("chat_id") not in self._chat_ids:
                     continue
-
                 content = msg.get("content") or {}
-                ctype = content.get("@type")
-                file_obj = None
-                suggested = None
-                caption_text = ""
-
-                cap = content.get("caption") or {}
-                if isinstance(cap, dict):
-                    caption_text = str(cap.get("text") or "")
-
-                if ctype == "messageDocument":
-                    doc = content.get("document") or {}
-                    file_obj = doc.get("document")
-                    suggested = (doc.get("file_name") or "video")
-                elif ctype == "messageVideo":
-                    vid = content.get("video") or {}
-                    file_obj = vid.get("video")
-                    suggested = (vid.get("file_name") or "video")
-
-                if not file_obj:
+                ctype = str(content.get("@type") or "")
+                self._emit("log", message=f"incoming message type: {ctype}")
+                msg_id = int(msg.get("id") or 0)
+                if self._history_bootstrap_pending:
+                    # Ignore live updates until baseline is established.
                     continue
-
-                file_id = file_obj.get("id")
-                if not file_id:
+                if msg_id and msg_id <= self._min_message_id_to_accept:
                     continue
+                msg_date = int(msg.get("date") or 0)
+                if self._accept_recent_seconds > 0 and msg_date > 0:
+                    if (int(time.time()) - msg_date) > self._accept_recent_seconds:
+                        continue
+                if msg_id and msg_id in self._seen_message_ids:
+                    continue
+                media = self._extract_media_from_message(msg)
+                if not media:
+                    if msg_id:
+                        self._seen_message_ids.add(msg_id)
+                    self._emit("log", message="message ignored (not video/document)")
+                    continue
+                if msg_id:
+                    self._seen_message_ids.add(msg_id)
+                file_id, suggested, caption_text = media
+                self._emit("log", message=f"queued media from message: {suggested} (file_id={file_id})")
+                self._handle_new_media(file_id, suggested, caption_text)
+                continue
 
-                self._handle_new_media(int(file_id), str(suggested), caption_text)
+            if ut == "messages":
+                if not self._listening_enabled or not self._chat_id:
+                    continue
+                arr = upd.get("messages") or []
+                if not isinstance(arr, list):
+                    continue
+                self._emit("log", message=f"history sync fetched {len(arr)} messages")
+                if self._history_bootstrap_pending:
+                    latest = 0
+                    for msg in arr:
+                        if isinstance(msg, dict):
+                            try:
+                                latest = max(latest, int(msg.get("id") or 0))
+                            except Exception:
+                                pass
+                    self._min_message_id_to_accept = max(self._min_message_id_to_accept, latest)
+                    self._history_bootstrap_pending = False
+                    self._emit("log", message=f"baseline set at message_id={self._min_message_id_to_accept}")
+                    continue
+                for msg in arr:
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("chat_id") not in self._chat_ids:
+                        continue
+                    msg_id = int(msg.get("id") or 0)
+                    if msg_id and msg_id <= self._min_message_id_to_accept:
+                        continue
+                    msg_date = int(msg.get("date") or 0)
+                    if self._accept_recent_seconds > 0 and msg_date > 0:
+                        if (int(time.time()) - msg_date) > self._accept_recent_seconds:
+                            continue
+                    if msg_id and msg_id in self._seen_message_ids:
+                        continue
+                    media = self._extract_media_from_message(msg)
+                    if media:
+                        file_id, suggested, caption_text = media
+                        self._handle_new_media(file_id, suggested, caption_text)
+                    if msg_id:
+                        self._seen_message_ids.add(msg_id)
                 continue
 
             if ut == "updateFile":
                 f = upd.get("file") or {}
                 self._handle_update_file(f)
+                self._emit_health()
                 continue
 
             # Responses from getFile are plain "file" objects

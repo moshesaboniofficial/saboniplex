@@ -1,0 +1,16 @@
+﻿[
+  {
+    "match": "example noisy movie name",
+    "kind": "movie",
+    "name": "Example Movie",
+    "year": "2024",
+    "root": "movies"
+  },
+  {
+    "match": "example noisy series",
+    "kind": "series",
+    "name": "Example Show",
+    "season": 1,
+    "episode": 1
+  }
+]
