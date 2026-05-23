@@ -71,6 +71,7 @@ class SaboniPlexApp:
         self._engine_status_text = ""
         self._last_log_ts = 0.0
         self._ai_status_text = self._compute_ai_status()
+        self._telegram_connected = False
 
         self._apply_telegram_theme()
         self._build_ui()
@@ -92,6 +93,16 @@ class SaboniPlexApp:
 
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, padx=10)
 
+        self.tg_conn_frame = ttk.Labelframe(self.root, text="Telegram", padding=(10, 8))
+        self.tg_conn_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(8, 0))
+        self.tg_conn_var = tk.StringVar(value="לא מחובר לטלגרם")
+        self.tg_conn_lbl = ttk.Label(self.tg_conn_frame, textvariable=self.tg_conn_var, anchor=tk.E, justify=tk.RIGHT)
+        self.tg_conn_lbl.pack(side=tk.RIGHT)
+        self.tg_reconnect_btn = ttk.Button(self.tg_conn_frame, text="התחבר מחדש", command=self._reconnect_telegram, style="TG.TButton")
+        self.tg_reconnect_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self.tg_disconnect_btn = ttk.Button(self.tg_conn_frame, text="נתק", command=self._disconnect_telegram, style="TG.TButton")
+        self.tg_disconnect_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
         # Auth panel (shows only when needed)
         self.auth_frame = ttk.Labelframe(self.root, text="התחברות לטלגרם", padding=(10, 8))
         self.auth_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(8, 0))
@@ -111,6 +122,7 @@ class SaboniPlexApp:
 
         self._auth_kind = None
         self._set_auth_visible(False)
+        self._update_telegram_controls()
 
         content = ttk.Frame(self.root, padding=(10, 10, 10, 8))
         content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -239,7 +251,7 @@ class SaboniPlexApp:
 
     def _set_auth_visible(self, visible: bool):
         if visible:
-            self.auth_frame.pack_configure(side=tk.TOP, fill=tk.X, padx=10, pady=(8, 0))
+            self.auth_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(8, 0))
         else:
             self.auth_frame.pack_forget()
 
@@ -322,6 +334,35 @@ class SaboniPlexApp:
 
     def _stop_all(self):
         self.commands.put({"cmd": "stop_all"})
+
+    def _reconnect_telegram(self):
+        self.commands.put({"cmd": "reconnect_telegram"})
+        # Let user start login immediately even before TDLib asks for phone.
+        self._auth_kind = "phone"
+        self._telegram_connected = False
+        self._update_telegram_controls()
+        self._set_auth_visible(True)
+        self.auth_label.config(text="הכנס מספר טלפון (+972...):")
+        self.auth_entry.delete(0, tk.END)
+        self.auth_entry.focus_set()
+        self.root.after(60, lambda: self._prompt_auth_popup("phone"))
+        self.status_var.set("התחברות מחדש: הזן מספר טלפון")
+
+    def _disconnect_telegram(self):
+        self.commands.put({"cmd": "disconnect_telegram"})
+        self._telegram_connected = False
+        self._update_telegram_controls()
+        self.status_var.set("בוצעה בקשת ניתוק מטלגרם")
+
+    def _update_telegram_controls(self):
+        if self._telegram_connected:
+            self.tg_conn_var.set("מחובר לטלגרם")
+            self.tg_disconnect_btn.state(["!disabled"])
+            self.tg_reconnect_btn.state(["disabled"])
+        else:
+            self.tg_conn_var.set("לא מחובר לטלגרם")
+            self.tg_disconnect_btn.state(["disabled"])
+            self.tg_reconnect_btn.state(["!disabled"])
 
     def _clear_completed(self):
         self.commands.put({"cmd": "clear_completed"})
@@ -552,6 +593,23 @@ class SaboniPlexApp:
             self.commands.put({"cmd": "auth_password", "value": val})
         self.auth_entry.delete(0, tk.END)
 
+    def _prompt_auth_popup(self, kind: str):
+        if kind == "phone":
+            val = simpledialog.askstring("התחברות לטלגרם", "הכנס מספר טלפון (+972...):", parent=self.root)
+            if val:
+                self.commands.put({"cmd": "auth_phone", "value": val.strip()})
+            return
+        if kind == "code":
+            val = simpledialog.askstring("קוד אימות", "הכנס קוד מטלגרם:", parent=self.root)
+            if val:
+                self.commands.put({"cmd": "auth_code", "value": val.strip()})
+            return
+        if kind == "password":
+            val = simpledialog.askstring("אימות דו-שלבי", "הכנס סיסמה:", parent=self.root, show="*")
+            if val:
+                self.commands.put({"cmd": "auth_password", "value": val.strip()})
+            return
+
     def _is_visible_by_filter(self, fid: int) -> bool:
         mode = str(self.view_mode.get() or "all").lower()
         if mode != "failed":
@@ -610,6 +668,12 @@ class SaboniPlexApp:
                 self._engine_status_text = str(st_he)
 
             self.status_var.set(self._engine_status_text)
+            if st in {"finding_chat", "chat_ready", "listening", "running", "paused"}:
+                self._telegram_connected = True
+                self._update_telegram_controls()
+            if st == "error" and "authorization" in str(msg or "").lower():
+                self._telegram_connected = False
+                self._update_telegram_controls()
             return
 
         if typ == "log":
@@ -638,6 +702,8 @@ class SaboniPlexApp:
         if typ == "auth_request":
             kind = ev.get("kind")
             self._auth_kind = kind
+            self._telegram_connected = False
+            self._update_telegram_controls()
             self._set_auth_visible(True)
             if kind == "phone":
                 self.auth_label.config(text="הכנס מספר טלפון (+972...):")
@@ -648,10 +714,14 @@ class SaboniPlexApp:
             else:
                 self.auth_label.config(text="הכנס ערך:")
             self.auth_entry.focus_set()
+            if kind in {"phone", "code", "password"}:
+                self.root.after(60, lambda k=kind: self._prompt_auth_popup(k))
             return
 
         if typ == "auth_ready":
             self._auth_kind = None
+            self._telegram_connected = True
+            self._update_telegram_controls()
             self._set_auth_visible(False)
             return
 
@@ -773,6 +843,8 @@ class SaboniPlexApp:
             bootstrap = bool(ev.get("bootstrap_pending"))
             sync_state = "Syncing..." if bootstrap else "Live"
             self.health_var.set(f"Active {active} | Queue {queued} | Total {total} | Chats {len(chat_ids)} | {sync_state}")
+            self._telegram_connected = bool(ev.get("authorized"))
+            self._update_telegram_controls()
             self._refresh_ai_status()
             return
 

@@ -206,6 +206,8 @@ class TdlibDownloadWorker(threading.Thread):
             total_items=len(self._items),
             last_history_sync_ts=self._last_history_sync_ts,
             bootstrap_pending=self._history_bootstrap_pending,
+            authorized=bool(self._authorized),
+            auth_waiting_for=self._auth_waiting_for or "",
         )
 
     @staticmethod
@@ -669,6 +671,22 @@ class TdlibDownloadWorker(threading.Thread):
                 td_send(self._client_id, {"@type": "checkAuthenticationPassword", "password": pwd})
             return
 
+        if c == "disconnect_telegram":
+            if self._client_id:
+                self._emit("log", message="telegram logout requested")
+                td_send(self._client_id, {"@type": "logOut"})
+            return
+
+        if c == "reconnect_telegram":
+            if self._client_id:
+                # Force a clean re-login flow when possible.
+                if self._authorized:
+                    self._emit("log", message="telegram reconnect: logging out first")
+                    self._stop_listening()
+                    td_send(self._client_id, {"@type": "logOut"})
+                td_send(self._client_id, {"@type": "getAuthorizationState"})
+            return
+
         if c == "pause_item":
             fid = int(cmd.get("file_id"))
             it = self._items.get(fid)
@@ -720,18 +738,24 @@ class TdlibDownloadWorker(threading.Thread):
             return
 
         if state == "authorizationStateWaitPhoneNumber":
+            self._authorized = False
             self._auth_waiting_for = "phone"
             self._emit("auth_request", kind="phone")
+            self._emit_health()
             return
 
         if state == "authorizationStateWaitCode":
+            self._authorized = False
             self._auth_waiting_for = "code"
             self._emit("auth_request", kind="code")
+            self._emit_health()
             return
 
         if state == "authorizationStateWaitPassword":
+            self._authorized = False
             self._auth_waiting_for = "password"
             self._emit("auth_request", kind="password")
+            self._emit_health()
             return
 
         if state == "authorizationStateReady":
@@ -765,8 +789,31 @@ class TdlibDownloadWorker(threading.Thread):
                 self._emit_health()
             return
 
+        if state == "authorizationStateLoggingOut":
+            self._authorized = False
+            self._auth_waiting_for = None
+            self._stop_listening()
+            self._emit("engine_state", state="not_listening")
+            self._emit_health()
+            return
+
+        if state == "authorizationStateClosing":
+            self._authorized = False
+            self._auth_waiting_for = None
+            self._emit("engine_state", state="not_listening")
+            self._emit_health()
+            return
+
         if state == "authorizationStateClosed":
+            self._authorized = False
+            self._auth_waiting_for = None
+            self._chat_id = None
+            self._chat_ids = set()
+            self._listening_enabled = False
             self._emit("engine_state", state="error", message="TDLib authorization closed")
+            self._emit("log", message="reinitializing telegram client")
+            self._init_tdlib()
+            self._emit_health()
             return
 
     def run(self):
